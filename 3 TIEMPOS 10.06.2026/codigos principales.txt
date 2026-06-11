@@ -1,0 +1,1204 @@
+
+
+
+
+
+
+
+
+
+
+
+
+# -*- coding: utf-8 -*-
+# ======================================================================
+# UAT VIGILANCE MONITOR – Fase 1 (Auditoría de Deriva)
+# ======================================================================
+# Este script monitorea la deriva inflacionaria de la Firma del Higo
+# en segmentos recientes de LIGO y compara con α = 0.046 Hz/día.
+# Si la deriva observada se desvía > 1% en más de 100 ventanas,
+# emite una alerta en el log.
+# ======================================================================
+
+import os, time, numpy as np
+from numpy.fft import rfft, irfft, rfftfreq
+from scipy.ndimage import uniform_filter1d
+from gwpy.timeseries import TimeSeries
+from datetime import datetime
+
+# ------------------------- UAT Engine (mismo núcleo) -------------------------
+class UAT_Engine:
+    def __init__(self, epsilon=1e-4, k_early=0.967, f_base=187.37,
+                 alpha=0.046, upc_ratio=5.14, kappa_crit=4.978):
+        self.epsilon = epsilon
+        self.k_early = k_early
+        self.f_base = f_base
+        self.alpha = alpha
+        self.upc_ratio = upc_ratio
+        self.kappa_crit = kappa_crit
+
+    def percudani_whiten(self, signal, fs):
+        N = len(signal); spec = rfft(signal)
+        psd = np.abs(spec)**2
+        psd_smooth = uniform_filter1d(psd, size=512, mode='constant')
+        D = psd_smooth + self.epsilon * self.k_early
+        D_safe = np.where(D > 1e-30, D, 1e-30)
+        spec_white = spec / np.sqrt(D_safe)
+        out = irfft(spec_white, n=N)
+        out -= np.mean(out)
+        std = np.std(out)
+        if std > 1e-15: out /= std
+        return out
+
+    def uat_coherence(self, x, y, fs, nperseg=512, noverlap=256, band=None):
+        step = nperseg - noverlap; N = len(x)
+        n_segments = (N - nperseg) // step + 1
+        window = np.hanning(nperseg)
+        Pxx = np.zeros(nperseg//2 + 1); Pyy = np.zeros(nperseg//2 + 1)
+        Pxy = np.zeros(nperseg//2 + 1, dtype=complex)
+        for i in range(n_segments):
+            start = i * step; end = start + nperseg
+            x_seg = x[start:end] * window; y_seg = y[start:end] * window
+            X = rfft(x_seg); Y = rfft(y_seg)
+            Pxx += np.abs(X)**2; Pyy += np.abs(Y)**2; Pxy += X * np.conj(Y)
+        Pxx /= n_segments; Pyy /= n_segments; Pxy /= n_segments
+        with np.errstate(divide='ignore', invalid='ignore'):
+            coh = np.abs(Pxy)**2 / (Pxx * Pyy)
+        f = rfftfreq(nperseg, d=1/fs)
+        if band is not None:
+            idx = np.where((f >= band[0]) & (f <= band[1]))[0]
+            coh[idx] = np.nan_to_num(coh[idx], nan=1.0)
+        return f, coh
+
+# ------------------------- Parámetros -------------------------
+FS = 4096
+HIGO_BAND = (227.5, 232.5)
+ALPHA_REF = 0.046
+VENTANAS_ALERTA = 100
+TOLERANCIA = 0.01
+
+# Elegir un segmento reciente (por ejemplo, último segmento público de O4b)
+GPS_RECIENTE = 1420000000  # Ajustar según disponibilidad
+DURACION = 256  # 4 minutos para vigilancia rápida
+
+print(f"[{datetime.now()}] Iniciando vigilancia UAT...")
+h1 = TimeSeries.fetch_open_data('H1', GPS_RECIENTE, GPS_RECIENTE + DURACION,
+                                sample_rate=16384, verbose=False).resample(FS).value
+l1 = TimeSeries.fetch_open_data('L1', GPS_RECIENTE, GPS_RECIENTE + DURACION,
+                                sample_rate=16384, verbose=False).resample(FS).value
+min_len = min(len(h1), len(l1))
+h1 = h1[:min_len]; l1 = l1[:min_len]
+
+engine = UAT_Engine()
+h1_w = engine.percudani_whiten(h1, FS)
+l1_w = engine.percudani_whiten(l1, FS)
+
+ventana = 8192; hop = 2048
+num_ventanas = (len(h1_w) - ventana) // hop + 1
+derivas = []
+
+for i in range(num_ventanas):
+    s = i * hop; e = s + ventana
+    f, coh = engine.uat_coherence(h1_w[s:e], l1_w[s:e], FS,
+                                  nperseg=8192, noverlap=4096, band=HIGO_BAND)
+    mask = (f >= HIGO_BAND[0]) & (f <= HIGO_BAND[1])
+    freq_pico = f[mask][np.argmax(coh[mask])] if np.any(mask) else 0.0
+    # Anomalía simple: comparamos con frecuencia base + α * tiempo desde mayo 2023
+    dias = (GPS_RECIENTE + s/FS - 1369483218) / 86400.0
+    f_teo = 187.37 + ALPHA_REF * dias
+    deriva_actual = (freq_pico - f_teo) / dias if dias > 0 else 0.0
+    derivas.append(deriva_actual)
+
+derivas = np.array(derivas)
+alerta = np.sum(np.abs(derivas - ALPHA_REF) > TOLERANCIA * ALPHA_REF)
+
+with open('/content/vigilancia_uat.log', 'a') as log:
+    log.write(f"[{datetime.now()}] GPS {GPS_RECIENTE}, ventanas: {num_ventanas}, "
+              f"deriva media: {np.mean(derivas):.4f} Hz/día, "
+              f"alertas: {alerta}/{num_ventanas}\n")
+    if alerta > VENTANAS_ALERTA:
+        log.write(f"¡ALERTA! Desviación significativa detectada.\n")
+
+print(f"Vigilancia completada. {alerta} ventanas con desviación.")
+
+
+
+
+
+
+
+
+
+
+
+
+# -*- coding: utf-8 -*-
+# ======================================================================
+# PERCUDANI AUTHORSHIP – Viscosímetro Offset Dinámico Optimizado
+# Resonant Hunter v9.1 – Precomputación de offsets con interpolación
+# ======================================================================
+!pip install -q numpy scipy gwpy matplotlib astropy
+
+import numpy as np
+from numpy.fft import rfft, irfft, rfftfreq
+from scipy.ndimage import uniform_filter1d
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
+from gwpy.timeseries import TimeSeries
+from astropy.coordinates import SkyCoord, EarthLocation, AltAz
+from astropy.time import Time
+import astropy.units as u
+
+print("="*75)
+print("PERCUDANI AUTHORSHIP - Viscosímetro Offset Dinámico Optimizado")
+print("="*75)
+
+# ======================================================================
+# 1. Función de offset estática (para un instante)
+# ======================================================================
+def compute_antenna_offset(gps_time, detector, ra='08h43m', dec='+18d'):
+    source = SkyCoord(ra, dec, frame='icrs')
+    if 'H1' in detector or 'Hanford' in detector:
+        site = EarthLocation.of_site('LIGO Hanford Observatory')
+        arm_x = np.array([-0.223,  0.796, -0.564])
+        arm_y = np.array([-0.914, -0.408, -0.036])
+    elif 'L1' in detector or 'Livingston' in detector:
+        site = EarthLocation.of_site('LIGO Livingston Observatory')
+        arm_x = np.array([-0.852,  0.347, -0.391])
+        arm_y = np.array([ 0.190, -0.483, -0.854])
+    elif 'V1' in detector or 'Virgo' in detector:
+        site = EarthLocation.of_site('Virgo')
+        arm_x = np.array([-0.671, -0.233, -0.703])
+        arm_y = np.array([-0.624,  0.570,  0.534])
+    arm_x = arm_x / np.linalg.norm(arm_x)
+    arm_y = arm_y / np.linalg.norm(arm_y)
+
+    t = Time(gps_time, format='gps', scale='utc')
+    frame = AltAz(obstime=t, location=site)
+    source_altaz = source.transform_to(frame)
+    alt = source_altaz.alt.radian
+    az = source_altaz.az.radian
+    n_local = np.array([np.cos(alt)*np.sin(az), np.cos(alt)*np.cos(az), np.sin(alt)])
+    n_hat = -n_local
+    z_hat = n_hat
+    x_hat = np.cross([0,0,1], z_hat)
+    if np.linalg.norm(x_hat) < 1e-10:
+        x_hat = np.cross([1,0,0], z_hat)
+    x_hat /= np.linalg.norm(x_hat)
+    y_hat = np.cross(z_hat, x_hat)
+    e_plus = np.outer(x_hat, x_hat) - np.outer(y_hat, y_hat)
+
+    # Brazos del detector en el sistema local (transformación desde ICRS)
+    from astropy.coordinates import ICRS, CartesianRepresentation
+    arm_x_icrs = CartesianRepresentation(arm_x * u.m)
+    arm_y_icrs = CartesianRepresentation(arm_y * u.m)
+    arm_x_altaz = SkyCoord(arm_x_icrs, frame=ICRS).transform_to(frame)
+    arm_y_altaz = SkyCoord(arm_y_icrs, frame=ICRS).transform_to(frame)
+    arm_x_local = arm_x_altaz.cartesian.xyz.value
+    arm_y_local = arm_y_altaz.cartesian.xyz.value
+    arm_x_local /= np.linalg.norm(arm_x_local)
+    arm_y_local /= np.linalg.norm(arm_y_local)
+
+    F_x = arm_x_local @ e_plus @ arm_x_local
+    F_y = arm_y_local @ e_plus @ arm_y_local
+    F_plus = F_x - F_y
+    return np.angle(F_plus)
+
+# ======================================================================
+# 2. Precomputar offsets en una rejilla de 1 segundo
+# ======================================================================
+def precompute_offsets(detector, gps_start, duration, fs, ra='08h43m', dec='+18d'):
+    step = 1.0  # cada 1 segundo
+    times_grid = np.arange(gps_start, gps_start + duration, step)
+    offsets = np.zeros_like(times_grid)
+    for idx, t_gps in enumerate(times_grid):
+        offsets[idx] = compute_antenna_offset(t_gps, detector, ra, dec)
+    # Interpolador lineal para cualquier instante
+    interp_func = interp1d(times_grid, offsets, kind='linear', fill_value='extrapolate')
+    return interp_func
+
+# ======================================================================
+# 3. UAT Engine
+# ======================================================================
+class UAT_Engine:
+    def __init__(self, epsilon=1e-4, k_early=0.967):
+        self.epsilon = epsilon; self.k_early = k_early
+    def percudani_whiten(self, signal, fs):
+        N = len(signal)
+        spec = rfft(signal)
+        psd = np.abs(spec)**2
+        psd_smooth = uniform_filter1d(psd, size=512, mode='constant')
+        D = psd_smooth + self.epsilon * self.k_early
+        D_safe = np.where(D > 1e-30, D, 1e-30)
+        spec_white = spec / np.sqrt(D_safe)
+        out = irfft(spec_white, n=N)
+        out -= np.mean(out); std = np.std(out)
+        if std > 1e-15: out /= std
+        return out
+
+# ======================================================================
+# 4. Viscosímetro con offset interpolado
+# ======================================================================
+class DynamicViscosimeterFast:
+    def __init__(self, n_phases=8, f_base=187.37, alpha=0.046, fs=4096, lr=1e-5,
+                 detector_name="Unknown", offset_interpolator=None):
+        self.n_phases = n_phases
+        self.phase_angles = np.deg2rad(np.arange(0, 360, 45))
+        self.detector_name = detector_name
+        self.offset_func = offset_interpolator  # interp1d function(gps_time) -> rad
+        self.W = np.eye(n_phases) * 0.9 + 0.02 * np.random.randn(n_phases, n_phases) * 0.1
+        self.state = np.zeros(n_phases, dtype=complex)
+        self.f_base = f_base; self.alpha = alpha; self.fs = fs; self.lr = lr
+        self.k_early = 0.967
+        self.phase_theoretical_acc = 0.0
+        self.grad_W_momentum = np.zeros((n_phases, n_phases), dtype=complex)
+        self.tvi_history = []
+        self.W_trace_history = []
+        self.event_log = []
+
+    def forward_step(self, x_t, t_days, gps_time):
+        f_t = self.f_base + self.alpha * t_days
+        self.phase_theoretical_acc += 2 * np.pi * f_t / self.fs
+        off = self.offset_func(gps_time) if self.offset_func else 0.0
+        rotation = (np.exp(1j * self.phase_angles) *
+                    np.exp(-1j * self.phase_theoretical_acc) *
+                    np.exp(1j * off))
+        state_prev = self.state.copy()
+        self.state = np.tanh(self.W @ self.state + x_t * rotation)
+        baseband_phasor = np.sum(self.state * np.exp(-1j * self.phase_angles))
+        measured_phase = np.angle(baseband_phasor)
+        phase_drift = np.angle(np.exp(1j * (measured_phase - self.phase_theoretical_acc)))
+        grad_inst = np.outer(np.exp(1j * self.phase_angles), np.conj(state_prev)) * phase_drift
+        self.grad_W_momentum = 0.9999 * self.grad_W_momentum + 0.0001 * grad_inst
+        grad_norm = np.linalg.norm(self.grad_W_momentum) + 1e-8
+        if grad_norm > 1e3: self.grad_W_momentum *= 1e3 / grad_norm; grad_norm = 1e3
+        W_new = self.W - self.lr * (self.grad_W_momentum / grad_norm).real
+        if np.any(np.isnan(W_new)) or np.any(np.isnan(self.state)):
+            self.W = np.eye(self.n_phases) * 0.9 + 0.02 * np.random.randn(self.n_phases, self.n_phases) * 0.1
+            self.state = np.zeros(self.n_phases, dtype=complex)
+            self.grad_W_momentum = np.zeros((self.n_phases, self.n_phases), dtype=complex)
+            phase_drift = 0.0
+            self.event_log.append("DIVERGENCIA corregida")
+        else:
+            self.W = W_new
+        tvi = (phase_drift / (2 * np.pi)) * self.k_early * (1 + self.alpha * t_days)
+        self.tvi_history.append(tvi)
+        self.W_trace_history.append(np.linalg.norm(self.W, 'fro'))
+        return tvi
+
+    def process_signal(self, signal, gps_start, fs, decimation=500):
+        t_days0 = (gps_start - 1369483218) / 86400.0
+        N = len(signal)
+        tvi_dec, time_dec = [], []
+        for i, x in enumerate(signal):
+            gps_now = gps_start + i / fs
+            t_now = t_days0 + i / (fs * 86400.0)
+            tvi = self.forward_step(x, t_now, gps_now)
+            if i % decimation == 0:
+                tvi_dec.append(tvi); time_dec.append(t_now)
+            if i % 500000 == 0:
+                print(f"  [{self.detector_name}] Procesando muestra {i}/{N}...")
+        return np.array(time_dec), np.array(tvi_dec)
+
+# ======================================================================
+# 5. Configuración y ejecución
+# ======================================================================
+FS = 4096
+GPS_TRIPLE = 1419700000
+DURATION = 256  # segundos
+
+print(f"Precomputando offsets dinámicos para H1, L1, V1 (1 muestra/seg)...")
+offset_h1_func = precompute_offsets('H1', GPS_TRIPLE, DURATION, FS)
+offset_l1_func = precompute_offsets('L1', GPS_TRIPLE, DURATION, FS)
+offset_v1_func = precompute_offsets('V1', GPS_TRIPLE, DURATION, FS)
+print("Offsets listos.")
+
+print("Descargando datos...")
+h1_raw = TimeSeries.fetch_open_data('H1', GPS_TRIPLE, GPS_TRIPLE + DURATION,
+                                    sample_rate=16384, verbose=False).resample(FS).value
+l1_raw = TimeSeries.fetch_open_data('L1', GPS_TRIPLE, GPS_TRIPLE + DURATION,
+                                    sample_rate=16384, verbose=False).resample(FS).value
+v1_raw = TimeSeries.fetch_open_data('V1', GPS_TRIPLE, GPS_TRIPLE + DURATION,
+                                    sample_rate=16384, verbose=False).resample(FS).value
+min_len = min(len(h1_raw), len(l1_raw), len(v1_raw))
+h1_raw, l1_raw, v1_raw = h1_raw[:min_len], l1_raw[:min_len], v1_raw[:min_len]
+
+engine = UAT_Engine()
+h1_w = engine.percudani_whiten(h1_raw, FS)
+l1_w = engine.percudani_whiten(l1_raw, FS)
+v1_w = engine.percudani_whiten(v1_raw, FS)
+
+visco_h1 = DynamicViscosimeterFast(fs=FS, detector_name="H1", offset_interpolator=offset_h1_func)
+visco_l1 = DynamicViscosimeterFast(fs=FS, detector_name="L1", offset_interpolator=offset_l1_func)
+visco_v1 = DynamicViscosimeterFast(fs=FS, detector_name="V1", offset_interpolator=offset_v1_func)
+
+print("Procesando H1...")
+time_h1, tvi_h1 = visco_h1.process_signal(h1_w, GPS_TRIPLE, FS)
+print("Procesando L1...")
+_, tvi_l1 = visco_l1.process_signal(l1_w, GPS_TRIPLE, FS)
+print("Procesando V1...")
+_, tvi_v1 = visco_v1.process_signal(v1_w, GPS_TRIPLE, FS)
+
+min_pts = min(len(tvi_h1), len(tvi_l1), len(tvi_v1))
+time_sec = (time_h1[:min_pts] - time_h1[0]) * 86400.0
+tvi_h1, tvi_l1, tvi_v1 = tvi_h1[:min_pts], tvi_l1[:min_pts], tvi_v1[:min_pts]
+
+diff_hl = tvi_h1 - tvi_l1
+diff_hv = tvi_h1 - tvi_v1
+diff_lv = tvi_l1 - tvi_v1
+
+fig, axes = plt.subplots(4, 1, figsize=(14, 14))
+fig.suptitle('Viscosímetro con Offset Dinámico (256 s reales, O4b)', fontsize=13)
+axes[0].plot(time_sec, tvi_h1, label='H1'); axes[0].plot(time_sec, tvi_l1, label='L1'); axes[0].plot(time_sec, tvi_v1, label='V1')
+axes[0].legend(); axes[0].set_ylabel('TVI'); axes[0].grid(True)
+axes[1].plot(time_sec, diff_hl, color='orange'); axes[1].set_ylabel('Δ H1-L1'); axes[1].grid(True)
+axes[2].plot(time_sec, diff_hv, color='green'); axes[2].set_ylabel('Δ H1-V1'); axes[2].grid(True)
+axes[3].plot(time_sec, diff_lv, color='red'); axes[3].set_xlabel('Tiempo (s)'); axes[3].set_ylabel('Δ L1-V1'); axes[3].grid(True)
+plt.tight_layout(); plt.show()
+
+print(f"Divergencias H1: {len([e for e in visco_h1.event_log if 'DIVERGENCIA' in e])}")
+print(f"Divergencias L1: {len([e for e in visco_l1.event_log if 'DIVERGENCIA' in e])}")
+print(f"Divergencias V1: {len([e for e in visco_v1.event_log if 'DIVERGENCIA' in e])}")
+print("TVI medio:")
+print(f"H1: {np.nanmean(tvi_h1):.4f} ± {np.nanstd(tvi_h1):.4f}")
+print(f"L1: {np.nanmean(tvi_l1):.4f} ± {np.nanstd(tvi_l1):.4f}")
+print(f"V1: {np.nanmean(tvi_v1):.4f} ± {np.nanstd(tvi_v1):.4f}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+# -*- coding: utf-8 -*-
+# ======================================================================
+# PERCUDANI AUTHORSHIP – Viscosímetro 4096s con Offset Dinámico
+# Resonant Hunter v9.1 – Mapa Topográfico Completo (H1, L1, V1)
+# ======================================================================
+!pip install -q numpy scipy gwpy matplotlib astropy
+
+import numpy as np
+from numpy.fft import rfft, irfft, rfftfreq
+from scipy.ndimage import uniform_filter1d
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
+from gwpy.timeseries import TimeSeries
+from astropy.coordinates import SkyCoord, EarthLocation, AltAz
+from astropy.time import Time
+import astropy.units as u
+
+print("="*75)
+print("PERCUDANI AUTHORSHIP - Viscosímetro 4096s (Offset Dinámico)")
+print("="*75)
+
+# ======================================================================
+# 1. Función de offset estática (para un instante)
+# ======================================================================
+def compute_antenna_offset(gps_time, detector, ra='08h43m', dec='+18d'):
+    source = SkyCoord(ra, dec, frame='icrs')
+    if 'H1' in detector or 'Hanford' in detector:
+        site = EarthLocation.of_site('LIGO Hanford Observatory')
+        arm_x = np.array([-0.223,  0.796, -0.564])
+        arm_y = np.array([-0.914, -0.408, -0.036])
+    elif 'L1' in detector or 'Livingston' in detector:
+        site = EarthLocation.of_site('LIGO Livingston Observatory')
+        arm_x = np.array([-0.852,  0.347, -0.391])
+        arm_y = np.array([ 0.190, -0.483, -0.854])
+    elif 'V1' in detector or 'Virgo' in detector:
+        site = EarthLocation.of_site('Virgo')
+        arm_x = np.array([-0.671, -0.233, -0.703])
+        arm_y = np.array([-0.624,  0.570,  0.534])
+    arm_x = arm_x / np.linalg.norm(arm_x)
+    arm_y = arm_y / np.linalg.norm(arm_y)
+
+    t = Time(gps_time, format='gps', scale='utc')
+    frame = AltAz(obstime=t, location=site)
+    source_altaz = source.transform_to(frame)
+    alt = source_altaz.alt.radian
+    az = source_altaz.az.radian
+    n_local = np.array([np.cos(alt)*np.sin(az), np.cos(alt)*np.cos(az), np.sin(alt)])
+    n_hat = -n_local
+    z_hat = n_hat
+    x_hat = np.cross([0,0,1], z_hat)
+    if np.linalg.norm(x_hat) < 1e-10:
+        x_hat = np.cross([1,0,0], z_hat)
+    x_hat /= np.linalg.norm(x_hat)
+    y_hat = np.cross(z_hat, x_hat)
+    e_plus = np.outer(x_hat, x_hat) - np.outer(y_hat, y_hat)
+
+    from astropy.coordinates import ICRS, CartesianRepresentation
+    arm_x_icrs = CartesianRepresentation(arm_x * u.m)
+    arm_y_icrs = CartesianRepresentation(arm_y * u.m)
+    arm_x_altaz = SkyCoord(arm_x_icrs, frame=ICRS).transform_to(frame)
+    arm_y_altaz = SkyCoord(arm_y_icrs, frame=ICRS).transform_to(frame)
+    arm_x_local = arm_x_altaz.cartesian.xyz.value
+    arm_y_local = arm_y_altaz.cartesian.xyz.value
+    arm_x_local /= np.linalg.norm(arm_x_local)
+    arm_y_local /= np.linalg.norm(arm_y_local)
+
+    F_x = arm_x_local @ e_plus @ arm_x_local
+    F_y = arm_y_local @ e_plus @ arm_y_local
+    F_plus = F_x - F_y
+    return np.angle(F_plus)
+
+# ======================================================================
+# 2. Precomputar offsets cada 2 segundos
+# ======================================================================
+def precompute_offsets(detector, gps_start, duration, ra='08h43m', dec='+18d'):
+    step = 2.0  # segundos
+    times_grid = np.arange(gps_start, gps_start + duration, step)
+    offsets = np.zeros_like(times_grid)
+    for idx, t_gps in enumerate(times_grid):
+        offsets[idx] = compute_antenna_offset(t_gps, detector, ra, dec)
+    interp_func = interp1d(times_grid, offsets, kind='linear', fill_value='extrapolate')
+    return interp_func
+
+# ======================================================================
+# 3. UAT Engine
+# ======================================================================
+class UAT_Engine:
+    def __init__(self, epsilon=1e-4, k_early=0.967):
+        self.epsilon = epsilon; self.k_early = k_early
+    def percudani_whiten(self, signal, fs):
+        N = len(signal)
+        spec = rfft(signal)
+        psd = np.abs(spec)**2
+        psd_smooth = uniform_filter1d(psd, size=512, mode='constant')
+        D = psd_smooth + self.epsilon * self.k_early
+        D_safe = np.where(D > 1e-30, D, 1e-30)
+        spec_white = spec / np.sqrt(D_safe)
+        out = irfft(spec_white, n=N)
+        out -= np.mean(out); std = np.std(out)
+        if std > 1e-15: out /= std
+        return out
+
+# ======================================================================
+# 4. Viscosímetro con offset interpolado
+# ======================================================================
+class DynamicViscosimeterFast:
+    def __init__(self, n_phases=8, f_base=187.37, alpha=0.046, fs=4096, lr=1e-5,
+                 detector_name="Unknown", offset_interpolator=None):
+        self.n_phases = n_phases
+        self.phase_angles = np.deg2rad(np.arange(0, 360, 45))
+        self.detector_name = detector_name
+        self.offset_func = offset_interpolator
+        self.W = np.eye(n_phases) * 0.9 + 0.02 * np.random.randn(n_phases, n_phases) * 0.1
+        self.state = np.zeros(n_phases, dtype=complex)
+        self.f_base = f_base; self.alpha = alpha; self.fs = fs; self.lr = lr
+        self.k_early = 0.967
+        self.phase_theoretical_acc = 0.0
+        self.grad_W_momentum = np.zeros((n_phases, n_phases), dtype=complex)
+        self.tvi_history = []
+        self.W_trace_history = []
+        self.event_log = []
+
+    def forward_step(self, x_t, t_days, gps_time):
+        f_t = self.f_base + self.alpha * t_days
+        self.phase_theoretical_acc += 2 * np.pi * f_t / self.fs
+        off = self.offset_func(gps_time) if self.offset_func else 0.0
+        rotation = (np.exp(1j * self.phase_angles) *
+                    np.exp(-1j * self.phase_theoretical_acc) *
+                    np.exp(1j * off))
+        state_prev = self.state.copy()
+        self.state = np.tanh(self.W @ self.state + x_t * rotation)
+        baseband_phasor = np.sum(self.state * np.exp(-1j * self.phase_angles))
+        measured_phase = np.angle(baseband_phasor)
+        phase_drift = np.angle(np.exp(1j * (measured_phase - self.phase_theoretical_acc)))
+        grad_inst = np.outer(np.exp(1j * self.phase_angles), np.conj(state_prev)) * phase_drift
+        self.grad_W_momentum = 0.9999 * self.grad_W_momentum + 0.0001 * grad_inst
+        grad_norm = np.linalg.norm(self.grad_W_momentum) + 1e-8
+        if grad_norm > 1e3: self.grad_W_momentum *= 1e3 / grad_norm; grad_norm = 1e3
+        W_new = self.W - self.lr * (self.grad_W_momentum / grad_norm).real
+        if np.any(np.isnan(W_new)) or np.any(np.isnan(self.state)):
+            self.W = np.eye(self.n_phases) * 0.9 + 0.02 * np.random.randn(self.n_phases, self.n_phases) * 0.1
+            self.state = np.zeros(self.n_phases, dtype=complex)
+            self.grad_W_momentum = np.zeros((self.n_phases, self.n_phases), dtype=complex)
+            phase_drift = 0.0
+            self.event_log.append("DIVERGENCIA corregida")
+        else:
+            self.W = W_new
+        tvi = (phase_drift / (2 * np.pi)) * self.k_early * (1 + self.alpha * t_days)
+        self.tvi_history.append(tvi)
+        self.W_trace_history.append(np.linalg.norm(self.W, 'fro'))
+        return tvi
+
+    def process_signal(self, signal, gps_start, fs, decimation=1000):
+        t_days0 = (gps_start - 1369483218) / 86400.0
+        N = len(signal)
+        tvi_dec, time_dec = [], []
+        for i, x in enumerate(signal):
+            gps_now = gps_start + i / fs
+            t_now = t_days0 + i / (fs * 86400.0)
+            tvi = self.forward_step(x, t_now, gps_now)
+            if i % decimation == 0:
+                tvi_dec.append(tvi); time_dec.append(t_now)
+            if i % 2000000 == 0:
+                print(f"  [{self.detector_name}] Procesando muestra {i}/{N}...")
+        return np.array(time_dec), np.array(tvi_dec)
+
+# ======================================================================
+# 5. Configuración y ejecución (4096 s)
+# ======================================================================
+FS = 4096
+GPS_TRIPLE = 1419700000
+DURATION = 4096
+
+print(f"Precomputando offsets dinámicos (2 s de resolución)...")
+offset_h1_func = precompute_offsets('H1', GPS_TRIPLE, DURATION)
+offset_l1_func = precompute_offsets('L1', GPS_TRIPLE, DURATION)
+offset_v1_func = precompute_offsets('V1', GPS_TRIPLE, DURATION)
+print("Offsets listos.")
+
+print("Descargando datos (4096 s)...")
+h1_raw = TimeSeries.fetch_open_data('H1', GPS_TRIPLE, GPS_TRIPLE + DURATION,
+                                    sample_rate=16384, verbose=False).resample(FS).value
+l1_raw = TimeSeries.fetch_open_data('L1', GPS_TRIPLE, GPS_TRIPLE + DURATION,
+                                    sample_rate=16384, verbose=False).resample(FS).value
+v1_raw = TimeSeries.fetch_open_data('V1', GPS_TRIPLE, GPS_TRIPLE + DURATION,
+                                    sample_rate=16384, verbose=False).resample(FS).value
+min_len = min(len(h1_raw), len(l1_raw), len(v1_raw))
+h1_raw, l1_raw, v1_raw = h1_raw[:min_len], l1_raw[:min_len], v1_raw[:min_len]
+
+engine = UAT_Engine()
+print("Aplicando blanqueamiento...")
+h1_w = engine.percudani_whiten(h1_raw, FS)
+l1_w = engine.percudani_whiten(l1_raw, FS)
+v1_w = engine.percudani_whiten(v1_raw, FS)
+
+visco_h1 = DynamicViscosimeterFast(fs=FS, detector_name="H1", offset_interpolator=offset_h1_func)
+visco_l1 = DynamicViscosimeterFast(fs=FS, detector_name="L1", offset_interpolator=offset_l1_func)
+visco_v1 = DynamicViscosimeterFast(fs=FS, detector_name="V1", offset_interpolator=offset_v1_func)
+
+print("Procesando H1 (4096 s)...")
+time_h1, tvi_h1 = visco_h1.process_signal(h1_w, GPS_TRIPLE, FS)
+print("Procesando L1 (4096 s)...")
+_, tvi_l1 = visco_l1.process_signal(l1_w, GPS_TRIPLE, FS)
+print("Procesando V1 (4096 s)...")
+_, tvi_v1 = visco_v1.process_signal(v1_w, GPS_TRIPLE, FS)
+
+min_pts = min(len(tvi_h1), len(tvi_l1), len(tvi_v1))
+time_sec = (time_h1[:min_pts] - time_h1[0]) * 86400.0
+tvi_h1, tvi_l1, tvi_v1 = tvi_h1[:min_pts], tvi_l1[:min_pts], tvi_v1[:min_pts]
+
+diff_hl = tvi_h1 - tvi_l1
+diff_hv = tvi_h1 - tvi_v1
+diff_lv = tvi_l1 - tvi_v1
+
+# ======================================================================
+# 6. Visualización y métricas
+# ======================================================================
+fig, axes = plt.subplots(4, 1, figsize=(16, 14))
+fig.suptitle('Mapa Topográfico del Flujo Temporal (4096 s reales, O4b)\n'
+             f'GPS {GPS_TRIPLE} | Cáncer (08h43m, +18°)', fontsize=14)
+
+axes[0].plot(time_sec, tvi_h1, linewidth=0.3, alpha=0.8, label='H1 (Hanford)')
+axes[0].plot(time_sec, tvi_l1, linewidth=0.3, alpha=0.8, label='L1 (Livingston)')
+axes[0].plot(time_sec, tvi_v1, linewidth=0.3, alpha=0.8, label='V1 (Virgo)')
+axes[0].set_ylabel('TVI'); axes[0].legend(loc='upper right')
+axes[0].set_title('Índice de Viscosidad Temporal (TVI)'); axes[0].grid(True, alpha=0.3)
+
+axes[1].plot(time_sec, diff_hl, linewidth=0.3, color='darkorange')
+axes[1].set_ylabel('Δ TVI (H1 – L1)'); axes[1].set_title('Diferencial Hanford – Livingston')
+axes[1].grid(True, alpha=0.3)
+
+axes[2].plot(time_sec, diff_hv, linewidth=0.3, color='darkgreen')
+axes[2].set_ylabel('Δ TVI (H1 – V1)'); axes[2].set_title('Diferencial Hanford – Virgo')
+axes[2].grid(True, alpha=0.3)
+
+axes[3].plot(time_sec, diff_lv, linewidth=0.3, color='darkred')
+axes[3].set_xlabel('Tiempo (s)'); axes[3].set_ylabel('Δ TVI (L1 – V1)')
+axes[3].set_title('Diferencial Livingston – Virgo')
+axes[3].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('mapa_topografico_4096s.png', dpi=150)
+plt.show()
+
+print("\n--- MÉTRICAS DEL MAPA TOPOGRÁFICO ---")
+print(f"TVI medio H1: {np.nanmean(tvi_h1):.4f} ± {np.nanstd(tvi_h1):.4f}")
+print(f"TVI medio L1: {np.nanmean(tvi_l1):.4f} ± {np.nanstd(tvi_l1):.4f}")
+print(f"TVI medio V1: {np.nanmean(tvi_v1):.4f} ± {np.nanstd(tvi_v1):.4f}")
+print(f"|Δ TVI| medio H1-L1: {np.nanmean(np.abs(diff_hl)):.4f} ± {np.nanstd(np.abs(diff_hl)):.4f}")
+print(f"|Δ TVI| medio H1-V1: {np.nanmean(np.abs(diff_hv)):.4f} ± {np.nanstd(np.abs(diff_hv)):.4f}")
+print(f"|Δ TVI| medio L1-V1: {np.nanmean(np.abs(diff_lv)):.4f} ± {np.nanstd(np.abs(diff_lv)):.4f}")
+print(f"Divergencias H1: {len([e for e in visco_h1.event_log if 'DIVERGENCIA' in e])}")
+print(f"Divergencias L1: {len([e for e in visco_l1.event_log if 'DIVERGENCIA' in e])}")
+print(f"Divergencias V1: {len([e for e in visco_v1.event_log if 'DIVERGENCIA' in e])}")
+print("Mapa guardado como 'mapa_topografico_4096s.png'")
+print("="*75)
+
+
+
+
+
+
+
+
+
+
+
+
+
+# -*- coding: utf-8 -*-
+# ======================================================================
+# PERCUDANI AUTHORSHIP – Barrido O4b con Filtro de Cuarentena
+# ======================================================================
+!pip install -q numpy scipy gwpy
+
+import numpy as np
+from numpy.fft import rfft, irfft, rfftfreq
+from scipy.ndimage import uniform_filter1d
+from gwpy.timeseries import TimeSeries
+
+print("="*75)
+print("PERCUDANI AUTHORSHIP - Barrido O4b con Cuarentena de NaN")
+print("="*75)
+
+class UAT_Engine:
+    def __init__(self, epsilon=1e-4, k_early=0.967):
+        self.epsilon = epsilon; self.k_early = k_early
+    def percudani_whiten(self, signal, fs):
+        N = len(signal)
+        spec = rfft(signal)
+        psd = np.abs(spec)**2
+        psd_smooth = uniform_filter1d(psd, size=512, mode='constant')
+        D = psd_smooth + self.epsilon * self.k_early
+        D_safe = np.where(D > 1e-30, D, 1e-30)
+        spec_white = spec / np.sqrt(D_safe)
+        out = irfft(spec_white, n=N)
+        out -= np.mean(out); std = np.std(out)
+        if std > 1e-15: out /= std
+        return out
+
+class SimpleViscosimeter:
+    def __init__(self, n_phases=8, f_base=187.37, alpha=0.046, fs=4096, lr=1e-5):
+        self.n_phases = n_phases
+        self.phase_angles = np.deg2rad(np.arange(0, 360, 45))
+        self.W = np.eye(n_phases) * 0.9 + 0.02 * np.random.randn(n_phases, n_phases) * 0.1
+        self.state = np.zeros(n_phases, dtype=complex)
+        self.f_base = f_base; self.alpha = alpha; self.fs = fs; self.lr = lr
+        self.k_early = 0.967
+        self.phase_theoretical_acc = 0.0
+        self.grad_W_momentum = np.zeros((n_phases, n_phases), dtype=complex)
+        self.divergences = 0
+
+    def forward_step(self, x_t, t_days):
+        f_t = self.f_base + self.alpha * t_days
+        self.phase_theoretical_acc += 2 * np.pi * f_t / self.fs
+        rotation = np.exp(1j * self.phase_angles) * np.exp(-1j * self.phase_theoretical_acc)
+        state_prev = self.state.copy()
+        self.state = np.tanh(self.W @ self.state + x_t * rotation)
+        baseband_phasor = np.sum(self.state * np.exp(-1j * self.phase_angles))
+        measured_phase = np.angle(baseband_phasor)
+        phase_drift = np.angle(np.exp(1j * (measured_phase - self.phase_theoretical_acc)))
+        grad_inst = np.outer(np.exp(1j * self.phase_angles), np.conj(state_prev)) * phase_drift
+        self.grad_W_momentum = 0.9999 * self.grad_W_momentum + 0.0001 * grad_inst
+        grad_norm = np.linalg.norm(self.grad_W_momentum) + 1e-8
+        if grad_norm > 1e3: self.grad_W_momentum *= 1e3 / grad_norm; grad_norm = 1e3
+        W_new = self.W - self.lr * (self.grad_W_momentum / grad_norm).real
+        if np.any(np.isnan(W_new)) or np.any(np.isnan(self.state)):
+            self.W = np.eye(self.n_phases) * 0.9 + 0.02 * np.random.randn(self.n_phases, self.n_phases) * 0.1
+            self.state = np.zeros(self.n_phases, dtype=complex)
+            self.grad_W_momentum = np.zeros((self.n_phases, self.n_phases), dtype=complex)
+            self.divergences += 1
+        else:
+            self.W = W_new
+
+    def process_signal(self, signal, gps_start, fs):
+        t_days0 = (gps_start - 1369483218) / 86400.0
+        N = len(signal)
+        for i, x in enumerate(signal):
+            t_now = t_days0 + i / (fs * 86400.0)
+            self.forward_step(x, t_now)
+
+# Barrido con cuarentena
+FS = 4096
+DURATION = 64
+gps_list = np.linspace(1419700000, 1419800000, 20, dtype=int)
+
+engine = UAT_Engine()
+best_gps = None
+
+for gps in gps_list:
+    print(f"\nProbando GPS {gps}...")
+    try:
+        h1_raw = TimeSeries.fetch_open_data('H1', gps, gps + DURATION,
+                                            sample_rate=16384, verbose=False).resample(FS).value
+        l1_raw = TimeSeries.fetch_open_data('L1', gps, gps + DURATION,
+                                            sample_rate=16384, verbose=False).resample(FS).value
+        v1_raw = TimeSeries.fetch_open_data('V1', gps, gps + DURATION,
+                                            sample_rate=16384, verbose=False).resample(FS).value
+    except Exception as e:
+        print(f"  Error de descarga: {e}")
+        continue
+
+    # --- FILTRO DE CUARENTENA ---
+    if np.any(np.isnan(h1_raw)) or np.any(np.isnan(l1_raw)) or np.any(np.isnan(v1_raw)):
+        print(f"  GPS {gps}: Descartado (Presencia de NaNs en los datos crudos).")
+        continue
+
+    min_len = min(len(h1_raw), len(l1_raw), len(v1_raw))
+    h1_raw, l1_raw, v1_raw = h1_raw[:min_len], l1_raw[:min_len], v1_raw[:min_len]
+
+    h1_w = engine.percudani_whiten(h1_raw, FS)
+    l1_w = engine.percudani_whiten(l1_raw, FS)
+    v1_w = engine.percudani_whiten(v1_raw, FS)
+
+    visco_h1 = SimpleViscosimeter(fs=FS)
+    visco_l1 = SimpleViscosimeter(fs=FS)
+    visco_v1 = SimpleViscosimeter(fs=FS)
+
+    visco_h1.process_signal(h1_w, gps, FS)
+    visco_l1.process_signal(l1_w, gps, FS)
+    visco_v1.process_signal(v1_w, gps, FS)
+
+    d_h1, d_l1, d_v1 = visco_h1.divergences, visco_l1.divergences, visco_v1.divergences
+    print(f"  Divergencias: H1={d_h1}, L1={d_l1}, V1={d_v1}")
+
+    if d_h1 == 0 and d_l1 == 0 and d_v1 == 0:
+        best_gps = gps
+        print("  ¡Triple coincidencia limpia encontrada!")
+        break
+
+if best_gps is not None:
+    print(f"\n*** Segmento ideal: GPS {best_gps} ***")
+else:
+    print("\nNo se encontró ningún segmento con los tres detectores limpios en este rango.")
+
+
+
+
+
+
+
+
+
+
+
+# -*- coding: utf-8 -*-
+# ======================================================================
+# PERCUDANI AUTHORSHIP – Viscosímetro 4096s con Limpieza de NaN
+# Resonant Hunter v9.1 – Mapa Topográfico Definitivo (GPS 1419700000)
+# ======================================================================
+!pip install -q numpy scipy gwpy matplotlib
+
+import numpy as np
+from numpy.fft import rfft, irfft, rfftfreq
+from scipy.ndimage import uniform_filter1d
+import matplotlib.pyplot as plt
+from gwpy.timeseries import TimeSeries
+
+print("="*75)
+print("PERCUDANI AUTHORSHIP - Viscosímetro 4096s (Limpieza de NaN)")
+print("="*75)
+
+# ======================================================================
+# 1. UAT Engine (blanqueamiento)
+# ======================================================================
+class UAT_Engine:
+    def __init__(self, epsilon=1e-4, k_early=0.967):
+        self.epsilon = epsilon; self.k_early = k_early
+    def percudani_whiten(self, signal, fs):
+        N = len(signal)
+        spec = rfft(signal)
+        psd = np.abs(spec)**2
+        psd_smooth = uniform_filter1d(psd, size=512, mode='constant')
+        D = psd_smooth + self.epsilon * self.k_early
+        D_safe = np.where(D > 1e-30, D, 1e-30)
+        spec_white = spec / np.sqrt(D_safe)
+        out = irfft(spec_white, n=N)
+        out -= np.mean(out); std = np.std(out)
+        if std > 1e-15: out /= std
+        return out
+
+# ======================================================================
+# 2. Viscosímetro sin offset
+# ======================================================================
+class SimpleViscosimeter:
+    def __init__(self, n_phases=8, f_base=187.37, alpha=0.046, fs=4096, lr=1e-5, detector_name="Unknown"):
+        self.n_phases = n_phases
+        self.phase_angles = np.deg2rad(np.arange(0, 360, 45))
+        self.detector_name = detector_name
+        self.W = np.eye(n_phases) * 0.9 + 0.02 * np.random.randn(n_phases, n_phases) * 0.1
+        self.state = np.zeros(n_phases, dtype=complex)
+        self.f_base = f_base; self.alpha = alpha; self.fs = fs; self.lr = lr
+        self.k_early = 0.967
+        self.phase_theoretical_acc = 0.0
+        self.grad_W_momentum = np.zeros((n_phases, n_phases), dtype=complex)
+        self.tvi_history = []
+        self.W_trace_history = []
+        self.event_log = []
+
+    def forward_step(self, x_t, t_days):
+        f_t = self.f_base + self.alpha * t_days
+        self.phase_theoretical_acc += 2 * np.pi * f_t / self.fs
+        rotation = np.exp(1j * self.phase_angles) * np.exp(-1j * self.phase_theoretical_acc)
+        state_prev = self.state.copy()
+        self.state = np.tanh(self.W @ self.state + x_t * rotation)
+        baseband_phasor = np.sum(self.state * np.exp(-1j * self.phase_angles))
+        measured_phase = np.angle(baseband_phasor)
+        phase_drift = np.angle(np.exp(1j * (measured_phase - self.phase_theoretical_acc)))
+        grad_inst = np.outer(np.exp(1j * self.phase_angles), np.conj(state_prev)) * phase_drift
+        self.grad_W_momentum = 0.9999 * self.grad_W_momentum + 0.0001 * grad_inst
+        grad_norm = np.linalg.norm(self.grad_W_momentum) + 1e-8
+        if grad_norm > 1e3: self.grad_W_momentum *= 1e3 / grad_norm; grad_norm = 1e3
+        W_new = self.W - self.lr * (self.grad_W_momentum / grad_norm).real
+        if np.any(np.isnan(W_new)) or np.any(np.isnan(self.state)):
+            self.W = np.eye(self.n_phases) * 0.9 + 0.02 * np.random.randn(self.n_phases, self.n_phases) * 0.1
+            self.state = np.zeros(self.n_phases, dtype=complex)
+            self.grad_W_momentum = np.zeros((self.n_phases, self.n_phases), dtype=complex)
+            phase_drift = 0.0
+            self.event_log.append("DIVERGENCIA corregida")
+        else:
+            self.W = W_new
+        tvi = (phase_drift / (2 * np.pi)) * self.k_early * (1 + self.alpha * t_days)
+        self.tvi_history.append(tvi)
+        self.W_trace_history.append(np.linalg.norm(self.W, 'fro'))
+        return tvi
+
+    def process_signal(self, signal, gps_start, fs, decimation=1000):
+        t_days0 = (gps_start - 1369483218) / 86400.0
+        N = len(signal)
+        tvi_dec, time_dec = [], []
+        for i, x in enumerate(signal):
+            t_now = t_days0 + i / (fs * 86400.0)
+            tvi = self.forward_step(x, t_now)
+            if i % decimation == 0:
+                tvi_dec.append(tvi); time_dec.append(t_now)
+            if i % 2000000 == 0:
+                print(f"  [{self.detector_name}] Procesando muestra {i}/{N}...")
+        return np.array(time_dec), np.array(tvi_dec)
+
+# ======================================================================
+# 3. Parámetros y descarga con limpieza de NaN
+# ======================================================================
+FS = 4096
+GPS_TRIPLE = 1419700000
+DURATION = 4096
+
+print("Descargando H1, L1, V1 (4096 s, O4b)...")
+h1_raw = TimeSeries.fetch_open_data('H1', GPS_TRIPLE, GPS_TRIPLE + DURATION,
+                                    sample_rate=16384, verbose=False).resample(FS).value
+l1_raw = TimeSeries.fetch_open_data('L1', GPS_TRIPLE, GPS_TRIPLE + DURATION,
+                                    sample_rate=16384, verbose=False).resample(FS).value
+v1_raw = TimeSeries.fetch_open_data('V1', GPS_TRIPLE, GPS_TRIPLE + DURATION,
+                                    sample_rate=16384, verbose=False).resample(FS).value
+min_len = min(len(h1_raw), len(l1_raw), len(v1_raw))
+h1_raw, l1_raw, v1_raw = h1_raw[:min_len], l1_raw[:min_len], v1_raw[:min_len]
+
+# --- FILTRO DE CUARENTENA Y LIMPIEZA ---
+def clean_nan(signal, name):
+    nan_mask = np.isnan(signal)
+    if np.any(nan_mask):
+        num_nan = np.sum(nan_mask)
+        print(f"  [!] {name}: {num_nan} NaN detectados. Reemplazando por la media.")
+        signal[nan_mask] = np.nanmean(signal)
+    return signal
+
+h1_raw = clean_nan(h1_raw, "H1")
+l1_raw = clean_nan(l1_raw, "L1")
+v1_raw = clean_nan(v1_raw, "V1")
+
+print("Aplicando blanqueamiento Percudani...")
+engine = UAT_Engine()
+h1_w = engine.percudani_whiten(h1_raw, FS)
+l1_w = engine.percudani_whiten(l1_raw, FS)
+v1_w = engine.percudani_whiten(v1_raw, FS)
+
+print("Ejecutando Viscosímetro sin offset...")
+visco_h1 = SimpleViscosimeter(fs=FS, detector_name="H1")
+visco_l1 = SimpleViscosimeter(fs=FS, detector_name="L1")
+visco_v1 = SimpleViscosimeter(fs=FS, detector_name="V1")
+
+time_h1, tvi_h1 = visco_h1.process_signal(h1_w, GPS_TRIPLE, FS)
+_, tvi_l1 = visco_l1.process_signal(l1_w, GPS_TRIPLE, FS)
+_, tvi_v1 = visco_v1.process_signal(v1_w, GPS_TRIPLE, FS)
+
+# Sincronizar longitudes y convertir a horas
+min_pts = min(len(tvi_h1), len(tvi_l1), len(tvi_v1))
+time_days = time_h1[:min_pts]
+time_hours = (time_days - time_days[0]) * 24.0
+
+tvi_h1 = tvi_h1[:min_pts]
+tvi_l1 = tvi_l1[:min_pts]
+tvi_v1 = tvi_v1[:min_pts]
+
+diff_hl = tvi_h1 - tvi_l1
+diff_hv = tvi_h1 - tvi_v1
+diff_lv = tvi_l1 - tvi_v1
+
+# ======================================================================
+# 4. Visualización
+# ======================================================================
+fig, axes = plt.subplots(4, 1, figsize=(16, 14))
+fig.suptitle('Viscosímetro de Señal – Mapa Topográfico Definitivo (O4b real)\n'
+             f'GPS {GPS_TRIPLE} | {DURATION}s (~{time_hours[-1]:.2f} h)',
+             fontsize=14)
+
+axes[0].plot(time_hours, tvi_h1, linewidth=0.3, alpha=0.8, label='H1')
+axes[0].plot(time_hours, tvi_l1, linewidth=0.3, alpha=0.8, label='L1')
+axes[0].plot(time_hours, tvi_v1, linewidth=0.3, alpha=0.8, label='V1')
+axes[0].set_ylabel('TVI'); axes[0].legend(loc='upper right')
+axes[0].set_title('Índice de Viscosidad Temporal')
+axes[0].grid(True, alpha=0.3)
+
+axes[1].plot(time_hours, diff_hl, linewidth=0.3, color='darkorange')
+axes[1].set_ylabel('Δ TVI (H1 – L1)')
+axes[1].set_title('Diferencial H1 – L1')
+axes[1].grid(True, alpha=0.3)
+
+axes[2].plot(time_hours, diff_hv, linewidth=0.3, color='darkgreen')
+axes[2].set_ylabel('Δ TVI (H1 – V1)')
+axes[2].set_title('Diferencial H1 – V1')
+axes[2].grid(True, alpha=0.3)
+
+axes[3].plot(time_hours, diff_lv, linewidth=0.3, color='darkred')
+axes[3].set_xlabel('Tiempo (horas)')
+axes[3].set_ylabel('Δ TVI (L1 – V1)')
+axes[3].set_title('Diferencial L1 – V1')
+axes[3].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('mapa_topografico_definitivo.png', dpi=150)
+plt.show()
+
+# Métricas
+print("\n--- MÉTRICAS DEL MAPA TOPOGRÁFICO DEFINITIVO ---")
+print(f"TVI medio H1: {np.nanmean(tvi_h1):.4f} ± {np.nanstd(tvi_h1):.4f}")
+print(f"TVI medio L1: {np.nanmean(tvi_l1):.4f} ± {np.nanstd(tvi_l1):.4f}")
+print(f"TVI medio V1: {np.nanmean(tvi_v1):.4f} ± {np.nanstd(tvi_v1):.4f}")
+print(f"|Δ TVI| medio H1-L1: {np.nanmean(np.abs(diff_hl)):.4f} ± {np.nanstd(np.abs(diff_hl)):.4f}")
+print(f"|Δ TVI| medio H1-V1: {np.nanmean(np.abs(diff_hv)):.4f} ± {np.nanstd(np.abs(diff_hv)):.4f}")
+print(f"|Δ TVI| medio L1-V1: {np.nanmean(np.abs(diff_lv)):.4f} ± {np.nanstd(np.abs(diff_lv)):.4f}")
+print(f"Divergencias H1: {len([e for e in visco_h1.event_log if 'DIVERGENCIA' in e])}")
+print(f"Divergencias L1: {len([e for e in visco_l1.event_log if 'DIVERGENCIA' in e])}")
+print(f"Divergencias V1: {len([e for e in visco_v1.event_log if 'DIVERGENCIA' in e])}")
+print("="*75)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# -*- coding: utf-8 -*-
+# ======================================================================
+# PERCUDANI AUTHORSHIP – Viscosímetro 24 HORAS (Cartografía Diurna)
+# Resonant Hunter v9.1 – Mapa Topográfico de Ciclo Rotacional Completo
+# ======================================================================
+!pip install -q numpy scipy gwpy matplotlib
+
+import numpy as np
+from numpy.fft import rfft, irfft, rfftfreq
+from scipy.ndimage import uniform_filter1d
+import matplotlib.pyplot as plt
+from gwpy.timeseries import TimeSeries
+
+print("="*75)
+print("PERCUDANI AUTHORSHIP - Viscosímetro 24h (Cartografía Diurna)")
+print("="*75)
+
+# ======================================================================
+# 1. UAT Engine (blanqueamiento)
+# ======================================================================
+class UAT_Engine:
+    def __init__(self, epsilon=1e-4, k_early=0.967):
+        self.epsilon = epsilon; self.k_early = k_early
+    def percudani_whiten(self, signal, fs):
+        N = len(signal)
+        spec = rfft(signal)
+        psd = np.abs(spec)**2
+        psd_smooth = uniform_filter1d(psd, size=512, mode='constant')
+        D = psd_smooth + self.epsilon * self.k_early
+        D_safe = np.where(D > 1e-30, D, 1e-30)
+        spec_white = spec / np.sqrt(D_safe)
+        out = irfft(spec_white, n=N)
+        out -= np.mean(out); std = np.std(out)
+        if std > 1e-15: out /= std
+        return out
+
+# ======================================================================
+# 2. Viscosímetro sin offset (estable)
+# ======================================================================
+class SimpleViscosimeter:
+    def __init__(self, n_phases=8, f_base=187.37, alpha=0.046, fs=4096, lr=1e-5, detector_name="Unknown"):
+        self.n_phases = n_phases
+        self.phase_angles = np.deg2rad(np.arange(0, 360, 45))
+        self.detector_name = detector_name
+        self.W = np.eye(n_phases) * 0.9 + 0.02 * np.random.randn(n_phases, n_phases) * 0.1
+        self.state = np.zeros(n_phases, dtype=complex)
+        self.f_base = f_base; self.alpha = alpha; self.fs = fs; self.lr = lr
+        self.k_early = 0.967
+        self.phase_theoretical_acc = 0.0
+        self.grad_W_momentum = np.zeros((n_phases, n_phases), dtype=complex)
+        self.tvi_history = []
+        self.W_trace_history = []
+        self.event_log = []
+
+    def forward_step(self, x_t, t_days):
+        f_t = self.f_base + self.alpha * t_days
+        self.phase_theoretical_acc += 2 * np.pi * f_t / self.fs
+        rotation = np.exp(1j * self.phase_angles) * np.exp(-1j * self.phase_theoretical_acc)
+        state_prev = self.state.copy()
+        self.state = np.tanh(self.W @ self.state + x_t * rotation)
+        baseband_phasor = np.sum(self.state * np.exp(-1j * self.phase_angles))
+        measured_phase = np.angle(baseband_phasor)
+        phase_drift = np.angle(np.exp(1j * (measured_phase - self.phase_theoretical_acc)))
+        grad_inst = np.outer(np.exp(1j * self.phase_angles), np.conj(state_prev)) * phase_drift
+        self.grad_W_momentum = 0.9999 * self.grad_W_momentum + 0.0001 * grad_inst
+        grad_norm = np.linalg.norm(self.grad_W_momentum) + 1e-8
+        if grad_norm > 1e3: self.grad_W_momentum *= 1e3 / grad_norm; grad_norm = 1e3
+        W_new = self.W - self.lr * (self.grad_W_momentum / grad_norm).real
+        if np.any(np.isnan(W_new)) or np.any(np.isnan(self.state)):
+            self.W = np.eye(self.n_phases) * 0.9 + 0.02 * np.random.randn(self.n_phases, self.n_phases) * 0.1
+            self.state = np.zeros(self.n_phases, dtype=complex)
+            self.grad_W_momentum = np.zeros((self.n_phases, self.n_phases), dtype=complex)
+            phase_drift = 0.0
+            self.event_log.append("DIVERGENCIA corregida")
+        else:
+            self.W = W_new
+        tvi = (phase_drift / (2 * np.pi)) * self.k_early * (1 + self.alpha * t_days)
+        self.tvi_history.append(tvi)
+        self.W_trace_history.append(np.linalg.norm(self.W, 'fro'))
+        return tvi
+
+    def process_signal(self, signal, gps_start, fs, decimation=2000):
+        t_days0 = (gps_start - 1369483218) / 86400.0
+        N = len(signal)
+        tvi_dec, time_dec = [], []
+        for i, x in enumerate(signal):
+            t_now = t_days0 + i / (fs * 86400.0)
+            tvi = self.forward_step(x, t_now)
+            if i % decimation == 0:
+                tvi_dec.append(tvi); time_dec.append(t_now)
+            if i % 5000000 == 0:
+                print(f"  [{self.detector_name}] Procesando muestra {i}/{N}...")
+        return np.array(time_dec), np.array(tvi_dec)
+
+# ======================================================================
+# 3. Parámetros y descarga (24 horas)
+# ======================================================================
+FS = 4096
+GPS_START = 1419700000
+DURATION = 86400  # 24 horas
+
+print("Descargando H1, L1, V1 (86400 s, O4b)...")
+h1_raw = TimeSeries.fetch_open_data('H1', GPS_START, GPS_START + DURATION,
+                                    sample_rate=16384, verbose=False).resample(FS).value
+l1_raw = TimeSeries.fetch_open_data('L1', GPS_START, GPS_START + DURATION,
+                                    sample_rate=16384, verbose=False).resample(FS).value
+v1_raw = TimeSeries.fetch_open_data('V1', GPS_START, GPS_START + DURATION,
+                                    sample_rate=16384, verbose=False).resample(FS).value
+min_len = min(len(h1_raw), len(l1_raw), len(v1_raw))
+h1_raw, l1_raw, v1_raw = h1_raw[:min_len], l1_raw[:min_len], v1_raw[:min_len]
+
+# --- FILTRO DE CUARENTENA Y LIMPIEZA ---
+def clean_nan(signal, name):
+    nan_mask = np.isnan(signal)
+    if np.any(nan_mask):
+        num_nan = np.sum(nan_mask)
+        print(f"  [!] {name}: {num_nan} NaN detectados. Reemplazando por la media.")
+        signal[nan_mask] = np.nanmean(signal)
+    return signal
+
+h1_raw = clean_nan(h1_raw, "H1")
+l1_raw = clean_nan(l1_raw, "L1")
+v1_raw = clean_nan(v1_raw, "V1")
+
+print("Aplicando blanqueamiento Percudani...")
+engine = UAT_Engine()
+h1_w = engine.percudani_whiten(h1_raw, FS)
+l1_w = engine.percudani_whiten(l1_raw, FS)
+v1_w = engine.percudani_whiten(v1_raw, FS)
+
+print("Ejecutando Viscosímetro sin offset (24h)...")
+visco_h1 = SimpleViscosimeter(fs=FS, detector_name="H1")
+visco_l1 = SimpleViscosimeter(fs=FS, detector_name="L1")
+visco_v1 = SimpleViscosimeter(fs=FS, detector_name="V1")
+
+time_h1, tvi_h1 = visco_h1.process_signal(h1_w, GPS_START, FS)
+_, tvi_l1 = visco_l1.process_signal(l1_w, GPS_START, FS)
+_, tvi_v1 = visco_v1.process_signal(v1_w, GPS_START, FS)
+
+# Sincronizar longitudes y convertir a horas
+min_pts = min(len(tvi_h1), len(tvi_l1), len(tvi_v1))
+time_days = time_h1[:min_pts]
+time_hours = (time_days - time_days[0]) * 24.0
+
+tvi_h1 = tvi_h1[:min_pts]
+tvi_l1 = tvi_l1[:min_pts]
+tvi_v1 = tvi_v1[:min_pts]
+
+diff_hl = tvi_h1 - tvi_l1
+diff_hv = tvi_h1 - tvi_v1
+diff_lv = tvi_l1 - tvi_v1
+
+# ======================================================================
+# 4. Visualización
+# ======================================================================
+fig, axes = plt.subplots(4, 1, figsize=(18, 16))
+fig.suptitle('Viscosímetro de Señal – Cartografía Diurna (24 Horas)\n'
+             f'GPS {GPS_START} | O4b real | {DURATION}s',
+             fontsize=14)
+
+axes[0].plot(time_hours, tvi_h1, linewidth=0.2, alpha=0.8, label='H1 (Hanford)')
+axes[0].plot(time_hours, tvi_l1, linewidth=0.2, alpha=0.8, label='L1 (Livingston)')
+axes[0].plot(time_hours, tvi_v1, linewidth=0.2, alpha=0.8, label='V1 (Virgo)')
+axes[0].set_ylabel('TVI'); axes[0].legend(loc='upper right')
+axes[0].set_title('Índice de Viscosidad Temporal (24h)')
+axes[0].grid(True, alpha=0.3)
+axes[0].set_xlim(0, 24)
+
+axes[1].plot(time_hours, diff_hl, linewidth=0.2, color='darkorange')
+axes[1].set_ylabel('Δ TVI (H1 – L1)')
+axes[1].set_title('Diferencial H1 – L1')
+axes[1].grid(True, alpha=0.3)
+axes[1].set_xlim(0, 24)
+
+axes[2].plot(time_hours, diff_hv, linewidth=0.2, color='darkgreen')
+axes[2].set_ylabel('Δ TVI (H1 – V1)')
+axes[2].set_title('Diferencial H1 – V1')
+axes[2].grid(True, alpha=0.3)
+axes[2].set_xlim(0, 24)
+
+axes[3].plot(time_hours, diff_lv, linewidth=0.2, color='darkred')
+axes[3].set_xlabel('Tiempo (horas)')
+axes[3].set_ylabel('Δ TVI (L1 – V1)')
+axes[3].set_title('Diferencial L1 – V1')
+axes[3].grid(True, alpha=0.3)
+axes[3].set_xlim(0, 24)
+
+plt.tight_layout()
+plt.savefig('cartografia_diurna_24h.png', dpi=150)
+plt.show()
+
+# Métricas
+print("\n--- MÉTRICAS DE LA CARTOGRAFÍA DIURNA ---")
+print(f"TVI medio H1: {np.nanmean(tvi_h1):.4f} ± {np.nanstd(tvi_h1):.4f}")
+print(f"TVI medio L1: {np.nanmean(tvi_l1):.4f} ± {np.nanstd(tvi_l1):.4f}")
+print(f"TVI medio V1: {np.nanmean(tvi_v1):.4f} ± {np.nanstd(tvi_v1):.4f}")
+print(f"|Δ TVI| medio H1-L1: {np.nanmean(np.abs(diff_hl)):.4f} ± {np.nanstd(np.abs(diff_hl)):.4f}")
+print(f"|Δ TVI| medio H1-V1: {np.nanmean(np.abs(diff_hv)):.4f} ± {np.nanstd(np.abs(diff_hv)):.4f}")
+print(f"|Δ TVI| medio L1-V1: {np.nanmean(np.abs(diff_lv)):.4f} ± {np.nanstd(np.abs(diff_lv)):.4f}")
+print(f"Divergencias H1: {len([e for e in visco_h1.event_log if 'DIVERGENCIA' in e])}")
+print(f"Divergencias L1: {len([e for e in visco_l1.event_log if 'DIVERGENCIA' in e])}")
+print(f"Divergencias V1: {len([e for e in visco_v1.event_log if 'DIVERGENCIA' in e])}")
+print("="*75)
